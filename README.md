@@ -37,16 +37,25 @@ PASS  a nested block comment hides the base until its own close  <-- pinned defe
 PASS  dynamic SQL in a string is UNVERIFIED, never silently clean  <-- pinned defect
 PASS  and an UNVERIFIED item alone exits 3, not 0
 ...
+PASS  a one-part name in a comma FROM list is a READ: a one-part name  <-- pinned defect
+...
+PASS  sp_executesql of a variable is DYNAMIC: exit 3, never clean  <-- pinned defect
+...
 PASS  an unqualified name shared with an unversioned table is AMBIGUOUS, not a guess  <-- pinned defect
 ...
 PASS  an encrypted trigger on a base is still a TRIGGER: the parent column says so  <-- pinned defect
 ...
+PASS  where the data owner is sde, its views, procedures and triggers are scanned; only the _evw view is Esri's  <-- pinned defect
+...
 PASS  a base read beside its a<n> and d<n> tables is HANDROLLED, not READ  <-- pinned defect
-PASS  and HANDROLLED never fails the gate
+PASS  and HANDROLLED never fails the gate, but it is not clean: exit 3 and a verdict that does not say clean  <-- pinned defect
+PASS  one a<n> and d<n> pair beside two bases excuses neither  <-- pinned defect
 ...
 PASS  a module with no definition is ENCRYPTED, never clean  <-- pinned defect
 ...
 PASS  a definition of exactly 4000 characters is TRUNCATED, and still scanned  <-- pinned defect
+...
+PASS  a run with no job export is not proven clean: a job step could read the base  <-- pinned defect
 ...
 PASS  a unique prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 PASS  and so is --app
@@ -56,18 +65,19 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  a failed assertion turns the footer and the exit code red  <-- pinned defect
 PASS  loading the file as a module defines the tool and runs nothing
 --------------------------------------------------------------------
-129 assertions, 0 failed
+179 assertions, 0 failed
 ```
 
-The full run prints all 129 assertions. The `...` lines are where this block is cut.
+The full run prints all 179 assertions. The `...` lines are where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-party package.
 The tool reads CSV files that you export once with the queries below.
 
-The self-test prints 129 assertions on Windows (Python 3.13) and on Ubuntu (Python 3.12.3). The
-code uses no syntax newer than Python 3.6, but 3.12 is the oldest interpreter it was run on.
+The self-test prints 179 assertions on Windows (Python 3.13), on Ubuntu (Python 3.12.3) and on
+Windows with CPython 3.9.25, which is the oldest interpreter it was run on. All three runs used
+`python -W error`. That run backs the "Python 3.9 or newer" claim above.
 
 ```
 git clone https://github.com/uhsear/evwlint.git
@@ -93,7 +103,11 @@ WHERE o.type IN ('U', 'V', 'P', 'TR', 'FN', 'IF', 'TF')
   AND o.is_ms_shipped = 0;
 ```
 
-### 2. Export the job steps (optional)
+### 2. Export the job steps
+
+The run exits 0 only when it was given a job export, because a job step is the place where the
+stale read hides longest. If the server has no Agent jobs, pass a CSV that holds only the header
+row.
 
 ```sql
 SELECT j.name AS job_name, s.step_id, s.step_name, s.subsystem,
@@ -102,10 +116,14 @@ FROM msdb.dbo.sysjobs AS j
 JOIN msdb.dbo.sysjobsteps AS s ON s.job_id = j.job_id;
 ```
 
+The job-step export can hold passwords and connection strings, because CmdExec and PowerShell
+steps carry them in the command. The tool never prints a command. Even so, store the file outside
+any repository, and delete it after the run. The `.gitignore` of this repository lists `*.csv`.
+
 ### 3. Save each result as a CSV
 
-A definition holds line breaks, so the CSV must quote its fields. `Export-Csv` does. This
-Windows PowerShell 5.1 snippet needs no extra module:
+A definition holds line breaks, so the CSV must quote its fields, and it must keep those line
+breaks. `Export-Csv` does both. This Windows PowerShell 5.1 snippet needs no extra module:
 
 ```powershell
 $cn = New-Object System.Data.SqlClient.SqlConnection "Server=YOURSERVER;Database=YOURDB;Integrated Security=true"
@@ -123,24 +141,26 @@ The tool reports a definition of exactly 4,000 characters as `TRUNCATED`.
 
 ```
 python evwlint.py --self-test
-python evwlint.py --objects objects.csv
 python evwlint.py --objects objects.csv --jobs jobsteps.csv
-python evwlint.py --objects objects.csv --skip gis.ROADS
-python evwlint.py --objects objects.csv --out findings.csv --apply
+python evwlint.py --objects objects.csv --jobs jobsteps.csv --skip gis.ROADS
+python evwlint.py --objects objects.csv --jobs jobsteps.csv --out findings.csv --apply
 ```
 
 | Flag | Default | What it does |
 |---|---|---|
 | `--objects` | none | The objects export. Required unless `--self-test`. |
-| `--jobs` | none | The job steps export. |
+| `--jobs` | none | The job steps export. Without it the run cannot exit 0. |
 | `--skip` | none | A versioned table to leave out, as `schema.table` or `database.schema.table`. Repeatable. |
-| `--out` | none | Write the findings to this CSV. Needs `--apply`. |
+| `--out` | none | Write the findings to this CSV. Needs `--apply`. It must not be an input file. |
 | `--apply` | off | Actually write `--out`. Without it nothing is written. |
 | `--self-test` | off | Run the assertions and exit. |
 
+Every parser option is spelled out in full. A prefix such as `--ap` is refused, so a shortened
+write flag cannot write by accident.
+
 Column names are matched without case, and extra columns are ignored. A UTF-8 BOM and the
 `#TYPE` line that Windows PowerShell's `Export-Csv` writes without `-NoTypeInformation` are both
-skipped.
+skipped. A UTF-16 file, such as `Export-Csv -Encoding Unicode` writes, is refused with exit 2.
 
 ## What it reports
 
@@ -181,6 +201,8 @@ This run is real. The two CSVs were exported from a SQL Server 2022 container wi
 above and the PowerShell snippet, which used SQL authentication there in place of
 `Integrated Security`. The database is synthetic. Its two `_evw` views are plain views
 made by hand to stand in for the views Esri creates, because the tool reads only their names.
+The CSVs are not part of this repository, because the repository holds four files. The
+self-test builds the same shapes from synthetic rows.
 
 `RoadsServing` names `gis.ROADS` three times: in a nested block comment, in a line comment and in
 its `FROM` clause. Only line 7, the `FROM` clause, is reported. The view `RoadsFixed`, which reads
@@ -192,10 +214,11 @@ itself; the procedure is.
 | `READ` | yes | A module or a T-SQL job step reads a versioned base table. |
 | `WRITE` | yes | It inserts, updates, deletes, merges or truncates the base table directly. |
 | `TRIGGER` | yes | A trigger is defined on a versioned base table. |
-| `HANDROLLED` | no | It reads the base table beside an `a<n>` and a `d<n>` table of one registration id. Somebody wrote the versioned view by hand. Compare it with `_evw`. |
+| `HANDROLLED` | no, exit 3 | It reads the base table beside an `a<n>` and a `d<n>` table of one registration id. Somebody wrote the versioned view by hand. Compare it with `_evw`. |
 | `AMBIGUOUS` | no, exit 3 | A one-part name matches the versioned table and an unversioned table in another schema. |
 | `IN_STRING` | no, exit 3 | The name is inside a string literal: dynamic SQL or message text. |
-| `ENCRYPTED` | no, exit 3 | The definition is empty: the module is encrypted, or the exporting login cannot see it. |
+| `DYNAMIC` | no, exit 3 | The object runs SQL that it builds at run time, so no table name is visible. |
+| `ENCRYPTED` | no, exit 3 | The definition is empty or the text `NULL`: the module is encrypted, or the exporting login cannot see it. |
 | `TRUNCATED` | no, exit 3 | The definition or command is exactly 4,000 characters long. |
 | `NOT_TSQL` | no, exit 3 | A PowerShell, CmdExec or other non-T-SQL job step names the table. |
 
@@ -215,15 +238,16 @@ WHERE referenced_entity_name = 'ROADS';
 
 | Code | Meaning |
 |---|---|
-| 0 | Proven clean: no finding, nothing unverified, and at least one versioned table was known. |
+| 0 | Proven clean: no finding, nothing unverified, a job export was given, and at least one versioned table was known. |
 | 1 | At least one `READ`, `WRITE` or `TRIGGER` finding. |
-| 2 | A file could not be read or written, or the CSV has a malformed quote. argparse also exits 2 on an unknown flag, such as `--ap`. |
-| 3 | Not proven. Only unverified items, or the export holds no `_evw` view at all. |
-| 64 | Usage error, including a missing column and a `--skip` that matches no versioned table. |
+| 2 | A file could not be read or written, or the CSV has a malformed quote or a NUL character. argparse also exits 2 on an unknown flag, such as `--ap`. |
+| 3 | Not proven. Unverified items, a `HANDROLLED` read, no `_evw` view in the export, or no `--jobs` file. |
+| 64 | Usage error, including a missing column, a `--skip` that matches no versioned table, and an `--out` that names an input file. |
 
 Exit 3 is not exit 0 on purpose. An export with no `_evw` view usually means the wrong database
 or a login that cannot see the views. A check that reported "clean" over nothing would never go
-red.
+red. The same holds for a run with no job export, and for an object that runs SQL the tool cannot
+read.
 
 ## How it decides
 
@@ -244,29 +268,45 @@ A query on the base table alone reads neither delta table.
 ([Edit versioned data in SQL Server using SQL](https://desktop.arcgis.com/en/arcmap/latest/manage-data/using-sql-with-gdbs/edit-versioned-data-using-sql-sqlserver.htm)).
 
 **Why a trigger is a finding.** An edit is stored in the adds and deletes tables, so a DML trigger
-on the base table does not fire when the edit is saved.
+on the base table does not see the edit when it is saved. No Esri page cited here says this in so
+many words. See Limits for what the finding rests on.
 
 **Hand-written views.** The adds and deletes tables are named `a<registration_id>` and
 `d<registration_id>`
 ([Versioned tables in a geodatabase in SQL Server](https://resources.arcgis.com/en/help/main/10.2/002q/002q0000007v000000.htm)).
 A module that reads the base table beside both tables of one number, in the same schema, is
-`HANDROLLED`. Aliases named `a17` and `d17` do not count; the self-test pins that.
+`HANDROLLED`. Aliases named `a17` and `d17` do not count; the self-test pins that. The export does
+not say which registration id belongs to which table. So one pair beside two versioned bases
+excuses neither, and both are `READ`.
 
-**Esri's own objects.** Objects in the `sde` schema, the `_evw` views, and triggers whose parent
-is an `_evw` view are counted and left alone. They read the base table by design.
+**Esri's own objects.** In a database where no versioned table lives in the `sde` schema, objects
+in the `sde` schema are counted and left alone. The same holds for the `_evw` views and for
+triggers whose parent is an `_evw` view. They read the base table by design. Where the data owner
+is `sde`, the user's own views, procedures and triggers live in that schema too, so there they are
+scanned.
 
 **Comments and strings.** Comments are removed first. T-SQL block comments nest: "Nested comments
 are supported" ([Slash Star](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/slash-star-comment-transact-sql)).
 A name inside a string literal is reported as `IN_STRING`. A double-quoted run that holds
 whitespace is treated as a string, because under `QUOTED_IDENTIFIER OFF` it is one.
 
+**Dynamic SQL.** `EXECUTE` accepts "@string_variable" or a constant string, joined with `+`, and
+`sp_executesql` runs a statement "built dynamically"
+([EXECUTE](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/execute-transact-sql),
+[sp_executesql](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-executesql-transact-sql)).
+The text that runs is not in the module. So `EXEC (@s)`, `EXEC ('a' + @t)`, `EXEC @proc` and
+`sp_executesql @s` are `DYNAMIC`. A constant string alone, `EXEC @rc = proc` and a named
+procedure are not, because the full text is in the file.
+
 **Names.** A two-part or three-part name is matched exactly. A four-part name is on a linked
 server and is not matched. A one-part name is matched only after `FROM`, `JOIN`, `INTO`,
-`UPDATE`, `TABLE`, `MERGE`, `USING`, `INSERT` or `DELETE`, because anywhere else it is usually a
-column. SQL Server can search more than one schema for a one-part name: "It takes less processing time
-for the Database Engine to resolve object names if it doesn't have to search multiple schemas"
+`UPDATE`, `TABLE`, `MERGE`, `USING`, `INSERT` or `DELETE`, or after a comma in a `FROM` list,
+because anywhere else it is usually a column. SQL Server can search more than one schema for a
+one-part name: "It takes less processing time for the Database Engine to resolve object names if
+it doesn't have to search multiple schemas"
 ([CREATE PROCEDURE](https://learn.microsoft.com/en-us/sql/t-sql/statements/create-procedure-transact-sql)).
-The schemas it searches depend on a default schema that no export records. So when an unversioned table shares the name, the tool reports `AMBIGUOUS` and does not guess.
+The schemas it searches depend on a default schema that no export records. So when an unversioned
+table shares the name, the tool reports `AMBIGUOUS` and does not guess.
 Names compare without case, as the default collations do.
 
 **Catalog facts.** `sys.objects.type` is `char(2)`, so a view arrives as `"V "` with a trailing
@@ -295,9 +335,10 @@ those four things.
 
 compressfloor names what holds the compress floor. It has no `_evw` handling.
 
-A `gh search repos` for `evwlint`, for `_evw versioned view` and for `versioned view lint sde`
-found no repository that does this check, on 2026-10-09. A code search for `_evw` found scripts
-that read through `_evw` themselves. None of them checks other code.
+A `gh search repos` for `evwlint`, for `_evw versioned view`, for `versioned view lint sde` and for
+`sde versioned view` found no repository that does this check, on 2026-10-09 and again on
+2026-10-13. A code search for `_evw` found scripts that read through `_evw` themselves. None of
+them checks other code.
 
 ## Limits
 
@@ -309,32 +350,78 @@ that read through `_evw` themselves. None of them checks other code.
   to be immediately moved from the delta tables" to the base tables
   ([versioning vocabulary](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/versioning-vocabulary.html)).
   The export does not show that option. Pass such a table to `--skip`. Each skip is listed with
-  its count.
+  its count, and the verdict says the skipped readers were not checked.
+- The trigger finding rests on the original incident and on the delta-table design, not on a
+  test. The SQL Server 2022 test container has no SDE, so no trigger was fired under versioning.
+  A compress moves rows into the base table with DML, and that move can fire such a trigger. So
+  the claim is only that the trigger does not see edits at save time.
+- Every trigger on a versioned base table is reported, including a disabled one, because
+  `is_disabled` is not exported.
 - One object is checked at a time. A job step that runs a flagged procedure is not linked to it.
-- A synonym that points at a base table is not followed.
-- A one-part name in a comma-separated `FROM a, b` list is not matched after the first table.
-- `UPDATE alias SET ... FROM base alias` is reported as `READ`, not `WRITE`. It still fails the
-  gate.
+- A synonym that points at a base table is not followed. A view that reads only the synonym gets
+  no verdict. The self-test pins this.
+- A one-part table name after `UPDATE TOP (n)` or `DELETE TOP (n)` is not matched, so
+  `UPDATE TOP (5) ROADS SET a = 1` is not reported. Write the schema, or expect the miss.
+- A one-part name after a comma in a `FROM` list is matched. The list ends at `WHERE`, `ORDER`,
+  `GROUP`, `UNION` and a few other words. A word the tool does not know leaves the list open, and
+  a later comma could then read a column that has a versioned table's name as that table.
+- An `UPDATE` or `DELETE` that names its target through an alias, such as `DELETE r FROM
+  gis.ROADS r` or `UPDATE alias SET ... FROM base alias`, is reported as `READ`, not `WRITE`.
+  It still fails the gate.
+- `DYNAMIC` has no `--skip`, because no table is named. An object that builds SQL at run time
+  keeps the run at exit 3 until it is rewritten or a person accepts that exit. The tool sees only
+  the `EXEC` and `sp_executesql` forms listed above.
 - A non-T-SQL job step is matched by name only, never parsed, and never fails the gate by itself.
+  A job step that runs a script file, for example `sqlcmd -i refresh.sql`, names no table, so it
+  is not reported at all. The tool reads the command text, never the file.
 - Identifiers compare without case. A database with a case-sensitive collation can hold two
   tables whose names differ only in case, and the tool treats them as one.
 - The export sees only what the exporting login may see. A module that login cannot see is
   missing from the export, not reported.
+- In a database where no versioned table lives in `sde`, everything in the `sde` schema is
+  treated as Esri's and not scanned. Where the data owner is `sde`, Esri's own objects in that
+  schema are scanned too. Whether any of them names a user table is not known, because this was
+  not tested against a real `sde`-owned geodatabase. Use `--skip` if one does.
+- A user view whose name ends in `_evw` is treated as Esri's and not scanned. It also marks the
+  table with the shorter name as versioned, so a name collision can cause a false `READ`.
+- The `parent` column is parsed as a plain dotted name. A table name with a space, a hyphen or a
+  leading digit, for example `gis.Road Segments`, is not recognised as the trigger's parent. Such
+  a trigger is reported as `READ` from its `ON` clause instead of `TRIGGER`, and an encrypted one
+  is missed. `--skip` of such a table also leaves out that `READ`.
+- A SQL export that lost its line breaks, as SSMS grid results saved to CSV can do by default,
+  turns everything after the first `--` comment into comment. The tool then exits 0 on a procedure
+  that reads the base table. Use the PowerShell snippet, or check that definitions keep their line
+  breaks. This was not verified against SSMS here, only against the flattened text.
+- SSMS may cut a saved definition at 65,535 characters. Only a cut at exactly 4,000 characters is
+  reported as `TRUNCATED`. Check the length of your longest definition. `sqlcmd` writes the text
+  `NULL` for an encrypted module, and the tool reads that as `ENCRYPTED`.
+- An export with tables and `_evw` views but no modules and no job steps, for example a type
+  filter that dropped `P`, `V` and `TR`, exits 0 with "scanned: 0 module(s)". Check the scanned
+  count before you trust exit 0.
+- A name that the output encoding cannot show prints as a backslash escape, such as `\u2265`, so a
+  redirected run on Windows does not crash. The self-test checks this with a cp1252 stream, not
+  with a real Windows console.
 - It opens no socket and imports no network or database module. There is no credential anywhere
   in it.
-- `--out` is the only file it writes, and only with `--apply`.
+- Apart from the scratch directory that `--self-test` creates and removes under the system temp
+  path, `--out` is the only file it writes, and only with `--apply`. `--apply` replaces `--out` if
+  it exists, and the tool refuses an `--out` that is the `--objects` or `--jobs` file.
 
 ## How it was tested
 
-- The self-test: 129 assertions, on Windows Python 3.13 and on Ubuntu Python 3.12.3. Branch
-  coverage is 100 percent.
+- The self-test: 179 assertions, on Windows Python 3.13, on Windows CPython 3.9.25 and on Ubuntu
+  Python 3.12.3. Branch coverage is 100 percent. The two Windows runs and the Ubuntu run print
+  the same lines.
 - A SQL Server 2022 container with the synthetic database above. The objects and the jobs were
   exported with the Windows PowerShell 5.1 snippet, with and without `-NoTypeInformation`. The
   output is the run shown under "What it reports". The Linux run on the same CSVs printed the
-  same text.
-- A 5,301-character procedure, exported with `Invoke-Sqlcmd` from the SqlServer module 22.3.0.
-  With the default it arrived as 4,000 characters, was reported as `TRUNCATED`, and its `READ`
-  was lost. With `-MaxCharLength 2147483647` the `READ` was found on line 83.
+  same text. The current code reproduces that output byte for byte from the saved CSVs.
+- A procedure longer than 4,000 characters, exported with `Invoke-Sqlcmd` from the SqlServer
+  module 22.3.0. With the default it arrived as 4,000 characters, was reported as `TRUNCATED`, and
+  its `READ` was lost. With `-MaxCharLength 2147483647` the whole text arrived and the `READ` was
+  found.
+- Not run for this version: the SQL queries and the PowerShell snippet above, because no SQL
+  Server was available when the dynamic-SQL, comma-list and `sde` changes were made.
 
 ## Contributing
 

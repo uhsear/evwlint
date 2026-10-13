@@ -13,21 +13,21 @@ This tool reads two catalog exports and names every module and job step that
 reads or writes a versioned base table, and every trigger defined on one:
 
     python evwlint.py --self-test
-    python evwlint.py --objects objects.csv
     python evwlint.py --objects objects.csv --jobs jobsteps.csv
-    python evwlint.py --objects objects.csv --skip gis.ROADS
-    python evwlint.py --objects objects.csv --out findings.csv --apply
+    python evwlint.py --objects objects.csv --jobs jobs.csv --skip gis.ROADS
+    python evwlint.py --objects objects.csv --jobs jobs.csv --out f.csv --apply
 
 A table is taken to be versioned when the export holds a view named after it
 with _evw on the end. Comments are stripped before the scan, and a name inside
 a string literal is reported as UNVERIFIED, because it is either dynamic SQL
-or message text and the tool cannot tell which. Nothing is written without
+or message text and the tool cannot tell which. SQL built at run time has no
+table name to find, so it is UNVERIFIED too. Nothing is written without
 --apply, and the tool opens no connection to anything.
 
 Exit codes: 0 no object reads a versioned base table and nothing was left
 unverified, 1 at least one object does, 2 a file could not be read or written,
-3 not proven (only unverified items, or no versioned table in the export), 64
-usage error.
+3 not proven (unverified items, a hand-written read for a human to compare, no
+versioned table in the export, or no --jobs file), 64 usage error.
 """
 
 from __future__ import print_function
@@ -79,10 +79,13 @@ IN_STRING = "IN_STRING"
 ENCRYPTED = "ENCRYPTED"
 TRUNCATED = "TRUNCATED"
 NOT_TSQL = "NOT_TSQL"
+# SQL built at run time (EXEC of a variable, sp_executesql): no table name is
+# visible, so the object cannot be shown clean.
+DYNAMIC = "DYNAMIC"
 
 FAILING = (READ, WRITE, TRIGGER)
 REVIEWING = (HANDROLLED,)
-UNPROVEN = (AMBIGUOUS, IN_STRING, ENCRYPTED, TRUNCATED, NOT_TSQL)
+UNPROVEN = (AMBIGUOUS, IN_STRING, ENCRYPTED, TRUNCATED, NOT_TSQL, DYNAMIC)
 
 OBJECT_COLUMNS = ("database", "schema", "name", "type", "parent",
                   "definition")
@@ -105,6 +108,15 @@ WRITE_VERBS = ("insert", "update", "delete", "merge")
 # INSERT INTO, DELETE FROM, MERGE INTO and TRUNCATE TABLE write too.
 WRITE_LEADS = ("into", "from", "table")
 WRITE_LEAD_VERBS = ("insert", "delete", "merge", "truncate")
+
+# These words end a FROM list, so a comma after one is not a table separator.
+FROM_END = ("where", "group", "order", "having", "union", "except",
+            "intersect", "option", "for", "select", "insert", "update",
+            "delete", "merge", "set", "values", "declare", "exec", "execute",
+            "if", "else", "begin", "end", "return", "print", "create",
+            "alter", "drop", "truncate", "use", "while", "output")
+# The dynamic-SQL words.
+EXEC_WORDS = ("exec", "execute")
 
 # Esri names a delta table a<registration_id> or d<registration_id>.
 DELTA_NAME = re.compile(r"^([ad])([0-9]+)$")
@@ -276,18 +288,33 @@ def tokenize(text):
 
 
 def names(tokens):
-    """Each dotted name as (parts, line, word before it, word before that).
+    """Each dotted name as (parts, line, word before it, word before that,
+    listed).
 
     db..table, which names the default schema, comes out as three parts with
-    an empty middle one.
+    an empty middle one. listed is True for a name that follows a comma in an
+    open FROM list, as in FROM a, b, where b is in a table position too.
     """
     i = 0
     n = len(tokens)
+    depth = 0
+    open_from = set()   # the bracket depths whose FROM list is still open
     while i < n:
-        if tokens[i][0] != ID:
+        kind, value, _line = tokens[i]
+        if kind == OTHER:
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                open_from.discard(depth)
+                depth = max(depth - 1, 0)
+            elif value == ";":
+                open_from.discard(depth)
             i += 1
             continue
-        parts = [tokens[i][1]]
+        if kind != ID:
+            i += 1
+            continue
+        parts = [value]
         j = i + 1
         while j + 1 < n and tokens[j][0] == DOT:
             if tokens[j + 1][0] == ID:
@@ -298,15 +325,22 @@ def names(tokens):
                 j += 1
             else:
                 break
+        listed = (depth in open_from and i >= 1
+                  and tokens[i - 1][:2] == (OTHER, ","))
+        if len(parts) == 1:
+            if value == "from":
+                open_from.add(depth)
+            elif value in FROM_END:
+                open_from.discard(depth)
         prev = tokens[i - 1][1] if i >= 1 and tokens[i - 1][0] == ID else None
         prev2 = tokens[i - 2][1] if i >= 2 and tokens[i - 2][0] == ID else None
-        yield parts, tokens[i][2], prev, prev2
+        yield parts, tokens[i][2], prev, prev2, listed
         i = j
 
 
 def parse_name(text):
     """The parts of the first dotted name in a short text, or []."""
-    for parts, _line, _prev, _prev2 in names(tokenize(text)):
+    for parts, _line, _prev, _prev2, _listed in names(tokenize(text)):
         return parts
     return []
 
@@ -316,27 +350,55 @@ def is_write(prev, prev2):
                                    and prev2 in WRITE_LEAD_VERBS)
 
 
+def dynamic_line(tokens):
+    """The line of the first statement that runs SQL built at run time, or
+    None. EXEC (@s), EXEC ('a' + @t), EXEC @proc and sp_executesql @s are
+    dynamic. EXEC ('a literal'), EXEC @rc = proc and a literal first argument
+    to sp_executesql are not: the whole text is in the file.
+    """
+    n = len(tokens)
+
+    def at(k):
+        return tokens[k][:2] if k < n else (None, None)
+
+    for i, (kind, value, line) in enumerate(tokens):
+        if kind != ID:
+            continue
+        if value in EXEC_WORDS:
+            if at(i + 1) == (OTHER, "("):
+                if not (at(i + 2)[0] == STR and at(i + 3) == (OTHER, ")")):
+                    return line
+            elif (at(i + 1)[0] == ID and at(i + 1)[1].startswith("@")
+                  and at(i + 2) != (OTHER, "=")):
+                return line
+        elif value == "sp_executesql":
+            if at(i + 1)[0] != STR or at(i + 2) == (OTHER, "+"):
+                return line
+    return None
+
+
 def scan(text, db, catalog, in_string=False, line_base=0):
     """Every name in a text that may mean a versioned base table.
 
-    Returns the hits, and the delta tables the text reads by hand as
-    (letter, registration id, schema or None) triples. A string literal is
-    scanned too, and what it finds is marked in_string, because it is dynamic
-    SQL or message text and the tool cannot tell which. A USE statement moves
-    the database that one-part and two-part names resolve in.
+    Returns the hits, the delta tables the text reads by hand as (letter,
+    registration id, schema or None) triples, and the line of the first
+    dynamic statement or None. A string literal is scanned too, and what it
+    finds is marked in_string, because it is dynamic SQL or message text and
+    the tool cannot tell which. A USE statement moves the database that
+    one-part and two-part names resolve in.
     """
     hits = []
     deltas = set()
     tokens = tokenize(text)
     for kind, value, line in tokens:
         if kind == STR:
-            sub, _ = scan(value, db, catalog, True, line_base + line - 1)
+            sub, _, _ = scan(value, db, catalog, True, line_base + line - 1)
             hits.extend(sub)
-    for parts, line, prev, prev2 in names(tokens):
+    for parts, line, prev, prev2, listed in names(tokens):
         if prev == "use" and len(parts) == 1:
             db = parts[0]
             continue
-        table_position = prev in TABLE_POSITION
+        table_position = prev in TABLE_POSITION or listed
         match = DELTA_NAME.match(parts[-1])
         if match and (len(parts) >= 2 or table_position):
             deltas.add((match.group(1), match.group(2),
@@ -345,20 +407,27 @@ def scan(text, db, catalog, in_string=False, line_base=0):
         for key in keys:
             hits.append(Hit(key, is_write(prev, prev2), line_base + line,
                             in_string, ambiguous))
-    return hits, deltas
+    dynamic = None if in_string else dynamic_line(tokens)
+    if dynamic is not None:
+        dynamic += line_base
+    return hits, deltas, dynamic
+
+
+def delta_pairs(deltas, schemas):
+    """The registration ids that have both an a<n> and a d<n>, in sorted
+    order. A pair must share the number and the schema, or have no schema."""
+    ids = {}
+    for letter, number, schema in deltas:
+        if schema is None or schema in schemas:
+            ids.setdefault(number, set()).add(letter)
+    return sorted(n for n in ids if ids[n] == {"a", "d"})
 
 
 def handrolled(key, deltas):
     """The registration id of an a<n> and d<n> pair this text reads beside
-    the base, or None. A pair must share the number and the schema."""
-    ids = {}
-    for letter, number, schema in deltas:
-        if schema in (None, key[1]):
-            ids.setdefault(number, set()).add(letter)
-    for number in sorted(ids):
-        if ids[number] == {"a", "d"}:
-            return number
-    return None
+    the base, or None."""
+    pairs = delta_pairs(deltas, (key[1],))
+    return pairs[0] if pairs else None
 
 
 # ------------------------------------------------------------------ analysis
@@ -372,6 +441,7 @@ class Report(object):
         self.skipped = {}
         self.modules = 0
         self.steps = 0
+        self.jobs_checked = False
         self.esri = 0
         self._seen = set()
 
@@ -394,6 +464,14 @@ def _evw(base):
 def _record(report, catalog, skip, where, hits, deltas, not_tsql=None,
             own_parent=None):
     """Turn the hits of one object into findings, most certain class first."""
+    # The export does not say which registration id belongs to which base. So
+    # a pair of delta tables excuses a read only when the object holds a pair
+    # for every base it reads. One pair beside two bases excuses neither.
+    plain = {h.key for h in hits
+             if h.key not in skip and not not_tsql and not h.in_string
+             and not h.ambiguous and not h.write and h.key != own_parent}
+    pairs = delta_pairs(deltas, {k[1] for k in plain})
+    pairable = len(pairs) >= len(plain)
     for hit in hits:
         base = catalog.display[hit.key]
         if hit.key in skip:
@@ -417,7 +495,7 @@ def _record(report, catalog, skip, where, hits, deltas, not_tsql=None,
         elif hit.key == own_parent:
             continue   # the ON clause of a trigger; TRIGGER already says it
         else:
-            number = handrolled(hit.key, deltas)
+            number = handrolled(hit.key, deltas) if pairable else None
             if number is None:
                 report.add(READ, where, base, hit.line,
                            "reads %s, which misses every edit still in the "
@@ -430,6 +508,14 @@ def _record(report, catalog, skip, where, hits, deltas, not_tsql=None,
                                                    _evw(base)))
 
 
+def _dynamic(report, where, line):
+    if line is not None:
+        report.add(DYNAMIC, where, "", line,
+                   "runs SQL it builds at run time (EXEC of a variable or a "
+                   "concatenation, or sp_executesql), so the tables it reads "
+                   "are not visible and it was not checked")
+
+
 def _object_key(obj, parts):
     """The (database, schema, name) key a parent column names."""
     if len(parts) >= 2:
@@ -437,8 +523,11 @@ def _object_key(obj, parts):
     return None
 
 
-def analyse(objects, steps=(), skip=()):
+def analyse(objects, steps=None, skip=()):
     """The whole decision: read rows in, a Report out. No I/O here.
+
+    steps None means no job export was given, and the run cannot be proven
+    clean. An empty list means the server has no job steps.
 
     skip is a list of dotted names of versioned tables to leave out, such as
     tables registered with the option to move edits to base. A skip that
@@ -447,6 +536,10 @@ def analyse(objects, steps=(), skip=()):
     """
     catalog = Catalog(objects)
     report = Report()
+    report.jobs_checked = steps is not None
+    # A database whose data owner is sde keeps its own views, procedures and
+    # triggers in the sde schema, beside Esri's. Only there are they scanned.
+    sde_owned = {k[0] for k in catalog.versioned if k[1] == ESRI_SCHEMA}
     report.versioned = sorted("%s.%s" % (k[0], catalog.display[k])
                               for k in catalog.versioned)
 
@@ -468,7 +561,7 @@ def analyse(objects, steps=(), skip=()):
         if kind is None:
             continue
         parent = _object_key(obj, parse_name(obj["parent"]))
-        if obj["schema"] == ESRI_SCHEMA or (
+        if (obj["schema"] == ESRI_SCHEMA and obj["db"] not in sde_owned) or (
                 obj["type"] == "V" and obj["name"].endswith(EVW_SUFFIX)) or (
                 parent and parent[2].endswith(EVW_SUFFIX)):
             # Esri's own: the sde schema, the _evw views, and the triggers on
@@ -490,7 +583,9 @@ def analyse(objects, steps=(), skip=()):
                            "the delta tables, so this trigger does not see "
                            "it" % base)
         definition = obj["definition"]
-        if not definition.strip():
+        # sqlcmd writes the text NULL for the NULL definition of an encrypted
+        # module, and no module body is only that word.
+        if not definition.strip() or definition.strip().upper() == "NULL":
             report.add(ENCRYPTED, where, "", None,
                        "has no definition in the export: encrypted, or not "
                        "visible to the login that exported it")
@@ -500,11 +595,12 @@ def analyse(objects, steps=(), skip=()):
                        "the definition is exactly %d characters, where "
                        "Invoke-Sqlcmd cuts text by default; re-export with "
                        "-MaxCharLength" % TRUNCATE_AT)
-        hits, deltas = scan(definition, obj["db"], catalog)
+        hits, deltas, dynamic = scan(definition, obj["db"], catalog)
+        _dynamic(report, where, dynamic)
         _record(report, catalog, skipped, where, hits, deltas,
                 own_parent=parent if obj["type"] == "TR" else None)
 
-    for step in steps:
+    for step in steps or ():
         report.steps += 1
         where = "job '%s' step %s '%s'" % (step["job_name"], step["step_id"],
                                            step["step_name"])
@@ -516,10 +612,11 @@ def analyse(objects, steps=(), skip=()):
                        "-MaxCharLength" % TRUNCATE_AT)
         subsystem = step["subsystem"]
         if subsystem.upper() == "TSQL":
-            hits, deltas = scan(command, step["db"] or None, catalog)
+            hits, deltas, dynamic = scan(command, step["db"] or None, catalog)
+            _dynamic(report, where, dynamic)
             _record(report, catalog, skipped, where, hits, deltas)
         else:
-            hits, _ = scan(command, step["db"] or None, catalog)
+            hits, _, _ = scan(command, step["db"] or None, catalog)
             _record(report, catalog, skipped, where, hits, set(),
                     not_tsql=subsystem or "unnamed")
     return report
@@ -529,7 +626,8 @@ def gate(report):
     """0 proven clean, 1 a finding, 3 not proven."""
     if report.of(FAILING):
         return 1
-    if report.of(UNPROVEN) or not report.versioned:
+    if (report.of(UNPROVEN) or report.of(REVIEWING) or not report.versioned
+            or not report.jobs_checked):
         return 3
     return 0
 
@@ -539,8 +637,10 @@ def describe(report):
     out = []
     out.append("versioned tables (an _evw view is in the export): %d"
                % len(report.versioned))
-    out.append("scanned: %d module(s), %d job step(s); %d Esri object(s) "
-               "left alone" % (report.modules, report.steps, report.esri))
+    jobs = ("%d job step(s)" % report.steps if report.jobs_checked
+            else "job steps not exported")
+    out.append("scanned: %d module(s), %s; %d Esri object(s) left alone"
+               % (report.modules, jobs, report.esri))
     for heading, classes in (
             ("FINDINGS: these read or write a versioned base table",
              FAILING),
@@ -570,9 +670,17 @@ def describe(report):
         out.append("VERDICT: NOT PROVEN. The export holds no _evw view, so no "
                    "table is known to be versioned. Check the database and "
                    "the login that exported it.")
-    elif report.of(UNPROVEN):
+    elif not report.jobs_checked:
+        out.append("VERDICT: NOT PROVEN. No --jobs export was given, so no "
+                   "Agent job step was checked. Pass a CSV with only the "
+                   "header row if the server has no jobs.")
+    elif report.of(UNPROVEN) or report.of(REVIEWING):
         out.append("VERDICT: NOT PROVEN. No finding, but %d item(s) could not "
-                   "be checked." % len(report.of(UNPROVEN)))
+                   "be checked or need a human."
+                   % len(report.of(UNPROVEN) + report.of(REVIEWING)))
+    elif report.skipped:
+        out.append("VERDICT: no object reads a versioned base table, apart "
+                   "from the SKIPPED ones above.")
     else:
         out.append("VERDICT: no object reads a versioned base table.")
     return out
@@ -758,6 +866,84 @@ def self_test():
     check(parse_name("db..t") == ["db", "", "t"],
           "db..t parses as three parts with an empty schema")
     check(parse_name("") == [], "an empty text holds no name")
+    r = run("/**/SELECT * FROM gis.ROADS")
+    check(classes(r) == [READ], "an empty block comment ends where it ends")
+    r = run("SELECT [a\nb] FROM gis.ROADS")
+    check(r.findings[0].line == 2,
+          "the line count survives a bracketed name that spans lines")
+    r = run("EXEC('gis.ROADS')", "P")
+    check(classes(r) == [IN_STRING], "a string that starts with the name")
+    r = run("EXEC(N'gis.ROADS')", "P")
+    check(classes(r) == [IN_STRING], "and an N'' string that starts with it")
+    r = run("SELECT 'x''gis.ROADS'")
+    check(classes(r) == [IN_STRING],
+          "and a name right after a doubled quote")
+    check(TRUNCATE_AT == 4000,
+          "the truncation length is the 4,000 the README promises")
+
+    # ---- FROM lists: a name after a comma is in a table position too
+    for sql, label in (
+            ("SELECT * FROM gis.LOOKUP l,gis.ROADS r", "a two-part name"),
+            ("SELECT * FROM gis.OTHER o, ROADS r", "a one-part name"),
+            ("SELECT * FROM gis.A a, gis.B b, ROADS r", "the third table"),
+            ("SELECT * FROM (SELECT 1 x) s, ROADS r", "after a subquery"),
+            ("SELECT * FROM gis.LOOKUP l\n, ROADS r", "after a line break"),
+            ("SELECT 1) FROM gis.LOOKUP l, ROADS r", "after a stray paren"),
+            ("UPDATE x SET a = 1 FROM gis.LOOKUP x, ROADS r",
+             "in an UPDATE ... FROM")):
+        r = run(sql, "P")
+        check(classes(r) == [READ] and r.findings[0].base == "gis.ROADS",
+              "a one-part name in a comma FROM list is a READ: %s"
+              "  <-- pinned defect" % label)
+    for sql, label in (
+            ("SELECT a, ROADS FROM gis.LOOKUP", "a select list"),
+            ("SELECT * FROM gis.LOOKUP ORDER BY a, ROADS", "an ORDER BY"),
+            ("SELECT * FROM gis.LOOKUP WHERE a IN (1, ROADS)", "a bracket"),
+            ("SELECT * FROM gis.LOOKUP; SELECT 1, ROADS", "the next statement"),
+            ("SELECT * FROM gis.LOOKUP SELECT 1, ROADS", "an unended one")):
+        r = run(sql, "P")
+        check(classes(r) == [],
+              "a comma outside a FROM list makes no table position: %s"
+              % label)
+    r = run("UPDATE TOP (5) ROADS SET a = 1", "P")
+    check(classes(r) == [],
+          "a known miss, pinned so the README Limits stay true: a one-part "
+          "name after UPDATE TOP (n)")
+
+    # ---- dynamic SQL: no table name to find, so no clean verdict
+    r = run("SET @s = N'INSERT gis.CopyOfRoads SELECT * FROM gis.' + "
+            "QUOTENAME(@t);\nEXEC sp_executesql @s;", "P")
+    check(classes(r) == [DYNAMIC] and gate(r) == 3
+          and r.findings[0].line == 2,
+          "sp_executesql of a variable is DYNAMIC: exit 3, never clean"
+          "  <-- pinned defect")
+    for sql, label in (
+            ("EXEC (@s)", "EXEC of a variable in brackets"),
+            ("EXECUTE (@s)", "EXECUTE"),
+            ("EXEC('SELECT * FROM gis.' + @t)", "a concatenation"),
+            ("EXEC @proc", "a procedure named by a variable"),
+            ("EXEC sp_executesql", "sp_executesql with no argument"),
+            ("EXEC sp_executesql N'SELECT * FROM gis.' + @t",
+             "sp_executesql of a concatenation")):
+        r = run(sql, "P")
+        check(DYNAMIC in classes(r) and gate(r) == 3,
+              "dynamic SQL is DYNAMIC: %s  <-- pinned defect" % label)
+    for sql, label in (
+            ("EXEC gis.refresh_lookup", "a named procedure"),
+            ("EXEC @rc = gis.refresh_lookup", "a return value"),
+            ("EXEC('SELECT 1')", "a whole literal"),
+            ("EXEC sp_executesql N'SELECT 1'", "a literal for sp_executesql"),
+            ("SELECT 'EXEC (@s)'", "the words inside a string"),
+            ("EXEC", "a bare EXEC at the end")):
+        r = run(sql, "P")
+        check(classes(r) == [], "not dynamic: %s" % label)
+    r = run("SELECT 1", steps=[_step("J", 1, "s", "TSQL", "gisdb",
+                                     "EXEC (@s)")])
+    check(classes(r) == [DYNAMIC] and "job 'J' step 1" in r.findings[0].where,
+          "a T-SQL job step with dynamic SQL is DYNAMIC too")
+    r = run("SELECT 1", steps=[_step("J", 1, "s", "PowerShell", "",
+                                     "EXEC (@s)")])
+    check(classes(r) == [], "and a PowerShell step is not read for it")
 
     # ---- writes
     for sql, label in (
@@ -816,6 +1002,31 @@ def self_test():
           "the sde schema and both _evw views are counted and left alone")
     r = run("SELECT * FROM gis.ROADS", "U", "SomeTable")
     check(r.modules == 0, "a table row carries no module and is not scanned")
+    sde_owned = [_obj("gisdb", "sde", "ROADS", "U"),
+                 _obj("gisdb", "sde", "ROADS_evw", "V", "SELECT 1"),
+                 _obj("gisdb", "sde", "RoadsServing", "V",
+                      "SELECT * FROM sde.ROADS"),
+                 _obj("gisdb", "sde", "refresh", "P",
+                      "INSERT INTO sde.Copy SELECT * FROM sde.ROADS"),
+                 _obj("gisdb", "sde", "t_roads", "TR", "SELECT 1",
+                      "sde.ROADS")]
+    r = analyse(sde_owned, [])
+    check(sorted(classes(r)) == [READ, READ, TRIGGER] and r.esri == 1
+          and r.modules == 3,
+          "where the data owner is sde, its views, procedures and triggers "
+          "are scanned; only the _evw view is Esri's  <-- pinned defect")
+    r = analyse(sde_owned + [_obj("other", "sde", "proc", "P",
+                                  "SELECT * FROM sde.ROADS")], [])
+    check(r.esri == 2,
+          "and the sde schema of a database with no versioned sde table "
+          "is still left alone")
+    r = analyse(base_catalog(
+        _obj("gisdb", "gis", "RoadsSyn", "SN"),
+        _obj("gisdb", "gis", "UsesSyn", "V", "SELECT * FROM gis.RoadsSyn")),
+        [])
+    check(classes(r) == [] and r.modules == 1,
+          "a synonym is not followed: a view that reads one gets no verdict "
+          "(a documented limit)")
 
     # ---- hand-rolled multiversioned views
     hand = ("SELECT * FROM gis.ROADS b WHERE NOT EXISTS (SELECT 1 FROM "
@@ -824,9 +1035,21 @@ def self_test():
     check(classes(r) == [HANDROLLED],
           "a base read beside its a<n> and d<n> tables is HANDROLLED, not "
           "READ  <-- pinned defect")
-    check(gate(r) == 0, "and HANDROLLED never fails the gate")
+    check(gate(r) == 3 and describe(r)[-1].startswith("VERDICT: NOT PROVEN"),
+          "and HANDROLLED never fails the gate, but it is not clean: exit 3 "
+          "and a verdict that does not say clean  <-- pinned defect")
     check("a17 and d17" in r.findings[0].detail,
           "and names the delta tables it found")
+    r = run("SELECT * FROM gis.ROADS r JOIN gis.PARCELS p ON 1=1 "
+            "JOIN gis.a5 ON 1=1 JOIN gis.d5 ON 1=1")
+    check(classes(r) == [READ, READ],
+          "one a<n> and d<n> pair beside two bases excuses neither"
+          "  <-- pinned defect")
+    r = run("SELECT * FROM gis.ROADS r JOIN gis.PARCELS p ON 1=1 "
+            "JOIN gis.a5 ON 1=1 JOIN gis.d5 ON 1=1 JOIN gis.a6 ON 1=1 "
+            "JOIN gis.d6 ON 1=1")
+    check(classes(r) == [HANDROLLED, HANDROLLED],
+          "and a pair for each base excuses both")
     r = run("SELECT * FROM gis.ROADS a17 JOIN gis.LOOKUP d17 ON 1=1")
     check(classes(r) == [READ],
           "aliases named a17 and d17 do not demote a READ"
@@ -860,6 +1083,10 @@ def self_test():
     check(gate(r) == 3, "and exits 3")
     r = run("   \n ", "P")
     check(classes(r) == [ENCRYPTED], "a definition of only whitespace too")
+    r = run("NULL", "P")
+    check(classes(r) == [ENCRYPTED],
+          "and the text NULL, which sqlcmd writes for an encrypted module"
+          "  <-- pinned defect")
     body = "SELECT * FROM gis.ROADS "
     cut = (body * 400)[:TRUNCATE_AT]
     r = run(cut, "P")
@@ -968,158 +1195,227 @@ def self_test():
     r = run("SELECT * FROM gis.PARCELS", skip=["gis.PARCELS"])
     check(any(x.startswith("SKIPPED") for x in describe(r)),
           "a skipped table gets its own heading")
+    check(gate(r) == 0 and "apart from the SKIPPED" in describe(r)[-1],
+          "and the verdict says the skipped readers were not checked"
+          "  <-- pinned defect")
+    r = analyse(base_catalog(_obj("gisdb", "gis", "V1", "V",
+                                  "SELECT * FROM gis.ROADS_evw")))
+    check(gate(r) == 3 and not r.jobs_checked
+          and describe(r)[-1].startswith("VERDICT: NOT PROVEN. No --jobs")
+          and "job steps not exported" in describe(r)[1],
+          "a run with no job export is not proven clean: a job step could "
+          "read the base  <-- pinned defect")
+    r = run("SELECT * FROM gis.ROADS")
+    check(r.steps == 0 and r.modules == 1 and r.jobs_checked
+          and r.esri == 2,
+          "the run counts its modules, steps and Esri objects")
+    r = run("SELECT 1", steps=[_step("J", 1, "a", "TSQL", "gisdb", "SELECT 1"),
+                               _step("J", 2, "b", "TSQL", "gisdb", "SELECT 2")])
+    check(r.steps == 2 and "2 job step(s)" in describe(r)[1],
+          "and counts each job step once")
     check(Finding(READ, "w", "b", None, "d").row()["line"] == "",
           "a finding with no line writes an empty line cell")
 
     # ---- the command line
     tmp = tempfile.mkdtemp(prefix="evwlint-selftest-")
 
-    def run_cli(argv):
-        out = io.StringIO()
-        err = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                code = main(argv)
-            except SystemExit as exc:
-                code = exc.code
-        return code, out.getvalue(), err.getvalue()
+    def cli_section():
 
-    def write(name, columns, rows, prefix=""):
-        path = os.path.join(tmp, name)
-        with open(path, "w", newline="", encoding="utf-8") as handle:
-            handle.write(prefix)
-            writer = csv.writer(handle)
-            writer.writerow(columns)
-            for row in rows:
-                writer.writerow(row)
-        return path
+        def run_cli(argv):
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = main(argv)
+                except SystemExit as exc:
+                    code = exc.code
+            return code, out.getvalue(), err.getvalue()
 
-    objects_rows = [
-        ["gisdb", "gis", "ROADS", "U ", "", ""],
-        ["gisdb", "gis", "ROADS_evw", "V ", "", "CREATE VIEW ..."],
-        ["gisdb", "gis", "RoadsView", "V ", "",
-         "CREATE VIEW gis.RoadsView AS\n-- base gis.ROADS is frozen\n"
-         "SELECT * FROM gis.ROADS"],
-        ["gisdb", "gis", "t_roads", "TR", "gis.ROADS",
-         "CREATE TRIGGER gis.t_roads ON gis.ROADS AFTER INSERT AS SELECT 1"],
-        ["gisdb", "gis", "Fixed", "V ", "", "SELECT * FROM gis.ROADS_evw"],
-    ]
-    objects_csv = write("objects.csv", OBJECT_COLUMNS, objects_rows)
-    jobs_csv = write("jobs.csv", JOB_COLUMNS,
-                     [["Nightly", "1", "load", "TSQL", "gisdb",
-                       "SELECT * FROM gis.ROADS"]])
-    code, out, err = run_cli(["--objects", objects_csv, "--jobs", jobs_csv])
-    check(code == 1, "the CLI exits 1 on a finding")
-    check("view gisdb.gis.RoadsView (line 3)" in out,
-          "and names the view and the line, past the comment that names "
-          "the base")
-    check("trigger gisdb.gis.t_roads" in out and "job 'Nightly' step 1" in out,
-          "and the trigger and the job step")
-    check("Fixed" not in out, "and leaves the repointed view out")
-    check(out.startswith("evwlint: %s 5 object(s), %s 1 job step(s)"
-                         % (objects_csv, jobs_csv)),
-          "and the first line counts what it read")
+        def write(name, columns, rows, prefix=""):
+            path = os.path.join(tmp, name)
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                handle.write(prefix)
+                writer = csv.writer(handle)
+                writer.writerow(columns)
+                for row in rows:
+                    writer.writerow(row)
+            return path
 
-    clean_csv = write("clean.csv", OBJECT_COLUMNS,
-                      [objects_rows[0], objects_rows[1], objects_rows[4]])
-    code, out, err = run_cli(["--objects", clean_csv])
-    check(code == 0 and "VERDICT: no object" in out,
-          "a clean export exits 0")
+        objects_rows = [
+            ["gisdb", "gis", "ROADS", "U ", "", ""],
+            ["gisdb", "gis", "ROADS_evw", "V ", "", "CREATE VIEW ..."],
+            ["gisdb", "gis", "RoadsView", "V ", "",
+             "CREATE VIEW gis.RoadsView AS\n-- base gis.ROADS is frozen\n"
+             "SELECT * FROM gis.ROADS"],
+            ["gisdb", "gis", "t_roads", "TR", "gis.ROADS",
+             "CREATE TRIGGER gis.t_roads ON gis.ROADS AFTER INSERT AS SELECT 1"],
+            ["gisdb", "gis", "Fixed", "V ", "", "SELECT * FROM gis.ROADS_evw"],
+        ]
+        objects_csv = write("objects.csv", OBJECT_COLUMNS, objects_rows)
+        jobs_csv = write("jobs.csv", JOB_COLUMNS,
+                         [["Nightly", "1", "load", "TSQL", "gisdb",
+                           "SELECT * FROM gis.ROADS"]])
+        none_csv = write("none.csv", JOB_COLUMNS, [])
+        code, out, err = run_cli(["--objects", objects_csv, "--jobs", jobs_csv])
+        check(code == 1, "the CLI exits 1 on a finding")
+        check("view gisdb.gis.RoadsView (line 3)" in out,
+              "and names the view and the line, past the comment that names "
+              "the base")
+        check("trigger gisdb.gis.t_roads" in out and "job 'Nightly' step 1" in out,
+              "and the trigger and the job step")
+        check("Fixed" not in out, "and leaves the repointed view out")
+        check(out.startswith("evwlint: %s 5 object(s), %s 1 job step(s)"
+                             % (objects_csv, jobs_csv)),
+              "and the first line counts what it read")
 
-    bom_csv = write("bom.csv", OBJECT_COLUMNS, objects_rows, "\ufeff")
-    code, out, err = run_cli(["--objects", bom_csv])
-    check(code == 1 and "RoadsView" in out,
-          "a UTF-8 BOM before the header is stripped  <-- pinned defect")
-    typed_csv = write("typed.csv", OBJECT_COLUMNS, objects_rows,
-                      "#TYPE System.Data.DataRow\n")
-    code, out, err = run_cli(["--objects", typed_csv])
-    check(code == 1 and "RoadsView" in out,
-          "a #TYPE line from Windows PowerShell Export-Csv is skipped"
-          "  <-- pinned defect")
-    upper_csv = write("upper.csv", [c.upper() for c in OBJECT_COLUMNS] +
-                      ["RowError"], [r + [""] for r in objects_rows])
-    code, out, err = run_cli(["--objects", upper_csv])
-    check(code == 1, "column names match without case, and extra columns "
-                     "are ignored")
-    big = "SELECT * FROM gis.ROADS_evw " + " " * 200000
-    big_csv = write("big.csv", OBJECT_COLUMNS,
-                    [objects_rows[1], ["gisdb", "gis", "Big", "P", "", big]])
-    code, out, err = run_cli(["--objects", big_csv])
-    check(code == 0,
-          "a definition over csv's 131072-character default limit is read"
-          "  <-- pinned defect")
+        clean_csv = write("clean.csv", OBJECT_COLUMNS,
+                          [objects_rows[0], objects_rows[1], objects_rows[4]])
+        code, out, err = run_cli(["--objects", clean_csv, "--jobs", none_csv])
+        check(code == 0 and "VERDICT: no object" in out
+              and "0 job step(s)" in out,
+              "a clean export with a header-only jobs file exits 0")
+        code, out, err = run_cli(["--objects", clean_csv])
+        check(code == 3 and "No --jobs export" in out,
+              "and the same export with no jobs file exits 3, not 0"
+              "  <-- pinned defect")
 
-    code, out, err = run_cli(["--objects", objects_csv, "--skip",
-                              "gis.ROADS"])
-    check(code == 0 and "SKIPPED" in out,
-          "--skip on the CLI leaves the table out and says so")
-    code, out, err = run_cli(["--objects", objects_csv, "--skip", "gis.NOPE"])
-    check(code == 64 and "matches no versioned table" in err,
-          "a --skip that matches nothing is a usage error, exit 64")
-
-    missing_csv = write("missing.csv", ["database", "schema", "name"], [])
-    code, out, err = run_cli(["--objects", missing_csv])
-    check(code == 64 and "parent, definition" in err and "It has:" in err,
-          "missing columns are a usage error that names them")
-    empty_csv = write("empty.csv", [], [])
-    code, out, err = run_cli(["--objects", empty_csv])
-    check(code == 64 and "(no columns at all)" in err,
-          "an empty CSV is a usage error, not a clean run")
-    code, out, err = run_cli(["--objects", objects_csv, "--jobs",
-                              missing_csv])
-    check(code == 64 and "job_name" in err,
-          "a jobs CSV without its columns is a usage error")
-    code, out, err = run_cli(["--objects", os.path.join(tmp, "nope.csv")])
-    check(code == 2, "an unreadable file exits 2, not 1")
-    quote_csv = os.path.join(tmp, "quote.csv")
-    with open(quote_csv, "w", newline="", encoding="utf-8") as handle:
-        handle.write(",".join(OBJECT_COLUMNS) + "\n\"a\"b,x\n")
-    code, out, err = run_cli(["--objects", quote_csv])
-    check(code == 2 and "error:" in err,
-          "a malformed quote is refused with exit 2, never read past"
-          "  <-- pinned defect")
-    nodef_csv = write("nodef.csv", OBJECT_COLUMNS,
-                      [objects_rows[1], ["gisdb", "gis", "Short", "P"]])
-    code, out, err = run_cli(["--objects", nodef_csv])
-    check(code == 3 and "ENCRYPTED" in out,
-          "a short row reads its missing cells as empty, and is ENCRYPTED")
-
-    out_csv = os.path.join(tmp, "findings.csv")
-    code, out, err = run_cli(["--objects", objects_csv, "--out", out_csv])
-    check(code == 1 and not os.path.exists(out_csv) and "Check only" in out,
-          "--out without --apply writes nothing  <-- pinned defect")
-    code, out, err = run_cli(["--objects", objects_csv, "--out", out_csv,
-                              "--apply"])
-    with open(out_csv, newline="", encoding="utf-8") as handle:
-        written = list(csv.DictReader(handle))
-    check(code == 1 and len(written) == 2
-          and written[0]["class"] == READ and written[0]["line"] == "3",
-          "--out --apply writes one row per finding with its line")
-    code, out, err = run_cli(["--objects", objects_csv, "--out", tmp,
-                              "--apply"])
-    check(code == 2 and "could not write" in err,
-          "an --out that cannot be written exits 2")
-    code, out, err = run_cli(["--objects", objects_csv, "--apply"])
-    check(code == 64, "--apply without --out is a usage error")
-    code, out, err = run_cli([])
-    check(code == 64 and "--objects" in err,
-          "no --objects is a usage error that names the flag")
-    code, out, err = run_cli(["--objects", objects_csv, "--ap"])
-    check(code == 2 and "unrecognized arguments: --ap" in err,
-          "a unique prefix --ap of --apply is REFUSED by the parser"
-          "  <-- pinned defect")
-    code, out, err = run_cli(["--objects", objects_csv, "--out", out_csv,
-                              "--app"])
-    check(code == 2 and "--app" in err, "and so is --app")
-
-    argv_before = sys.argv
-    try:
-        sys.argv = ["evwlint.py", "--objects", clean_csv]
-        code, out, err = run_cli(None)
+        bom_csv = write("bom.csv", OBJECT_COLUMNS, objects_rows, "\ufeff")
+        code, out, err = run_cli(["--objects", bom_csv])
+        check(code == 1 and "RoadsView" in out,
+              "a UTF-8 BOM before the header is stripped  <-- pinned defect")
+        typed_csv = write("typed.csv", OBJECT_COLUMNS, objects_rows,
+                          "#TYPE System.Data.DataRow\n")
+        code, out, err = run_cli(["--objects", typed_csv])
+        check(code == 1 and "RoadsView" in out,
+              "a #TYPE line from Windows PowerShell Export-Csv is skipped"
+              "  <-- pinned defect")
+        upper_csv = write("upper.csv", [c.upper() for c in OBJECT_COLUMNS] +
+                          ["RowError"], [r + [""] for r in objects_rows])
+        code, out, err = run_cli(["--objects", upper_csv])
+        check(code == 1, "column names match without case, and extra columns "
+                         "are ignored")
+        big = "SELECT * FROM gis.ROADS_evw " + " " * 200000
+        big_csv = write("big.csv", OBJECT_COLUMNS,
+                        [objects_rows[1], ["gisdb", "gis", "Big", "P", "", big]])
+        code, out, err = run_cli(["--objects", big_csv, "--jobs", none_csv])
         check(code == 0,
-              "main with no argv reads the arguments after the program name")
+              "a definition over csv's 131072-character default limit is read"
+              "  <-- pinned defect")
+
+        code, out, err = run_cli(["--objects", objects_csv, "--jobs", none_csv,
+                                  "--skip", "gis.ROADS"])
+        check(code == 0 and "SKIPPED" in out,
+              "--skip on the CLI leaves the table out and says so")
+        code, out, err = run_cli(["--objects", objects_csv, "--skip", "gis.NOPE"])
+        check(code == 64 and "matches no versioned table" in err,
+              "a --skip that matches nothing is a usage error, exit 64")
+
+        missing_csv = write("missing.csv", ["database", "schema", "name"], [])
+        code, out, err = run_cli(["--objects", missing_csv])
+        check(code == 64 and "parent, definition" in err and "It has:" in err,
+              "missing columns are a usage error that names them")
+        empty_csv = write("empty.csv", [], [])
+        code, out, err = run_cli(["--objects", empty_csv])
+        check(code == 64 and "(no columns at all)" in err,
+              "an empty CSV is a usage error, not a clean run")
+        code, out, err = run_cli(["--objects", objects_csv, "--jobs",
+                                  missing_csv])
+        check(code == 64 and "job_name" in err,
+              "a jobs CSV without its columns is a usage error")
+        code, out, err = run_cli(["--objects", os.path.join(tmp, "nope.csv")])
+        check(code == 2, "an unreadable file exits 2, not 1")
+        quote_csv = os.path.join(tmp, "quote.csv")
+        with open(quote_csv, "w", newline="", encoding="utf-8") as handle:
+            handle.write(",".join(OBJECT_COLUMNS) + "\n\"a\"b,x\n")
+        code, out, err = run_cli(["--objects", quote_csv])
+        check(code == 2 and "error:" in err,
+              "a malformed quote is refused with exit 2, never read past"
+              "  <-- pinned defect")
+        nodef_csv = write("nodef.csv", OBJECT_COLUMNS,
+                          [objects_rows[1], ["gisdb", "gis", "Short", "P"]])
+        code, out, err = run_cli(["--objects", nodef_csv])
+        check(code == 3 and "ENCRYPTED" in out,
+              "a short row reads its missing cells as empty, and is ENCRYPTED")
+
+        out_csv = os.path.join(tmp, "findings.csv")
+        code, out, err = run_cli(["--objects", objects_csv, "--out", out_csv])
+        check(code == 1 and not os.path.exists(out_csv) and "Check only" in out,
+              "--out without --apply writes nothing  <-- pinned defect")
+        code, out, err = run_cli(["--objects", objects_csv, "--out", out_csv,
+                                  "--apply"])
+        with open(out_csv, newline="", encoding="utf-8") as handle:
+            written = list(csv.DictReader(handle))
+        check(code == 1 and len(written) == 2
+              and written[0]["class"] == READ and written[0]["line"] == "3",
+              "--out --apply writes one row per finding with its line")
+        code, out, err = run_cli(["--objects", objects_csv, "--out", tmp,
+                                  "--apply"])
+        check(code == 2 and "could not write" in err,
+              "an --out that cannot be written exits 2")
+        before = os.path.getsize(objects_csv)
+        code, out, err = run_cli(["--objects", objects_csv, "--out",
+                                  objects_csv, "--apply"])
+        check(code == 64 and "names an input file" in err
+              and os.path.getsize(objects_csv) == before,
+              "an --out that is the --objects file is refused, and the "
+              "input is untouched  <-- pinned defect")
+        code, out, err = run_cli(["--objects", objects_csv, "--jobs", jobs_csv,
+                                  "--out", jobs_csv])
+        check(code == 64, "and so is one that is the --jobs file")
+        utf16_csv = os.path.join(tmp, "utf16.csv")
+        with open(utf16_csv, "w", newline="", encoding="utf-16") as handle:
+            handle.write(",".join(OBJECT_COLUMNS) + "\r\n")
+        code, out, err = run_cli(["--objects", utf16_csv])
+        check(code == 2 and "NUL" in err and "UTF-8" in err,
+              "a UTF-16 export is refused with exit 2 on every interpreter"
+              "  <-- pinned defect")
+        nul_csv = os.path.join(tmp, "nul.csv")
+        with open(nul_csv, "wb") as handle:
+            handle.write((",".join(OBJECT_COLUMNS) + "\n").encode("ascii")
+                         + b"a,b,c,d,e,f\x00\n")
+        code, out, err = run_cli(["--objects", nul_csv])
+        check(code == 2 and "NUL" in err,
+              "and so is a NUL byte inside a row")
+        uni_csv = write("uni.csv", OBJECT_COLUMNS,
+                        [objects_rows[1],
+                         ["gisdb", "gis", "Road\u2265s", "V", "",
+                          "SELECT * FROM gis.ROADS"]])
+        raw = io.BytesIO()
+        wrapper = io.TextIOWrapper(raw, encoding="cp1252", newline="")
+        with contextlib.redirect_stdout(wrapper), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = main(["--objects", uni_csv, "--jobs", none_csv])
+        wrapper.flush()
+        check(code == 1 and b"Road\\u2265s" in raw.getvalue(),
+              "a name the console code page cannot hold prints as an escape "
+              "and the run still exits 1 by its finding, not by a traceback"
+              "  <-- pinned defect")
+        code, out, err = run_cli(["--objects", objects_csv, "--apply"])
+        check(code == 64, "--apply without --out is a usage error")
+        code, out, err = run_cli([])
+        check(code == 64 and "--objects" in err,
+              "no --objects is a usage error that names the flag")
+        code, out, err = run_cli(["--objects", objects_csv, "--ap"])
+        check(code == 2 and "unrecognized arguments: --ap" in err,
+              "a unique prefix --ap of --apply is REFUSED by the parser"
+              "  <-- pinned defect")
+        code, out, err = run_cli(["--objects", objects_csv, "--out", out_csv,
+                                  "--app"])
+        check(code == 2 and "--app" in err, "and so is --app")
+
+        argv_before = sys.argv
+        try:
+            sys.argv = ["evwlint.py", "--objects", clean_csv, "--jobs", none_csv]
+            code, out, err = run_cli(None)
+            check(code == 0,
+                  "main with no argv reads the arguments after the program name")
+        finally:
+            sys.argv = argv_before
+
+    try:
+        cli_section()
     finally:
-        sys.argv = argv_before
+        shutil.rmtree(tmp, ignore_errors=True)
 
     # ---- the harness itself
     before = (passed[0], len(failed))
@@ -1147,10 +1443,10 @@ def self_test():
     check("analyse" in loaded,
           "loading the file as a module defines the tool and runs nothing")
 
-    shutil.rmtree(tmp, ignore_errors=True)
-
     print("-" * 68)
-    return _tally(passed[0], failed)
+    status = _tally(passed[0], failed)
+    # Not only _tally(): a broken footer must not turn a failure green.
+    return 1 if failed else status
 
 
 def _tally(passed, failed):
@@ -1166,6 +1462,18 @@ def _tally(passed, failed):
 
 
 # ----------------------------------------------------------------------- cli
+
+def _no_nul(lines):
+    """The lines unchanged, or csv.Error at the first NUL. A UTF-16 file
+    decoded as UTF-8 is full of them, and the csv module accepts a NUL on
+    Python 3.11 and later, so without this the exit code would depend on the
+    interpreter."""
+    for text in lines:
+        if "\0" in text:
+            raise csv.Error("the file holds a NUL character, as a UTF-16 "
+                            "file does; save the export as UTF-8")
+        yield text
+
 
 def read_csv(path, columns):
     """The rows of a CSV as dicts keyed by the lower-case column names given.
@@ -1187,7 +1495,7 @@ def read_csv(path, columns):
             handle.seek(0)
         # strict, so a stray quote stops the run instead of gluing two
         # definitions together and scanning neither as written.
-        reader = csv.reader(handle, strict=True)
+        reader = csv.reader(_no_nul(handle), strict=True)
         header = next(reader, [])
         index = {name.strip().lower(): i for i, name in enumerate(header)}
         absent = [c for c in columns if c not in index]
@@ -1235,7 +1543,10 @@ def _parse(argv):
     )
     ap.add_argument("--objects", help="sys.objects and sys.sql_modules "
                                       "export as CSV (see README)")
-    ap.add_argument("--jobs", help="msdb job steps export as CSV")
+    ap.add_argument("--jobs", help="msdb job steps export as CSV. Without "
+                                   "it the run cannot exit 0; pass a CSV "
+                                   "with only the header if there are no "
+                                   "jobs.")
     ap.add_argument("--skip", action="append", default=[],
                     metavar="SCHEMA.TABLE",
                     help="a versioned table to leave out, such as one "
@@ -1248,8 +1559,26 @@ def _parse(argv):
     return ap.parse_args(argv)
 
 
+def _tolerate_output_encoding():
+    """Print a name the console code page cannot hold as an escape. Without
+    this, a Unicode object name raises UnicodeEncodeError partway through the
+    report, and the traceback exits 1, which a scheduler reads as a finding.
+    A stream with no reconfigure() is left alone."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except AttributeError:
+            continue
+
+
+def _same_file(out, *inputs):
+    return os.path.exists(out) and any(
+        p and os.path.exists(p) and os.path.samefile(out, p) for p in inputs)
+
+
 def main(argv=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
+    _tolerate_output_encoding()
 
     if args.self_test:
         return self_test()
@@ -1261,21 +1590,26 @@ def main(argv=None):
         print("error: --apply needs --out.", file=sys.stderr)
         return 64
 
+    if args.out and _same_file(args.out, args.objects, args.jobs):
+        print("error: --out names an input file, and --apply would "
+              "overwrite it.", file=sys.stderr)
+        return 64
+
     try:
         objects = load_objects(args.objects)
-        steps = load_steps(args.jobs) if args.jobs else []
+        steps = load_steps(args.jobs) if args.jobs else None
         report = analyse(objects, steps, args.skip)
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 64
     except (IOError, OSError, csv.Error) as exc:
-        # csv.Error too: a NUL in the file is an unreadable input, and exit 1
+        # csv.Error too: a NUL or a bad quote is an unreadable input, and exit 1
         # would tell a scheduler that a finding exists.
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
     head = "evwlint: %s %d object(s)" % (args.objects, len(objects))
-    if args.jobs:
+    if steps is not None:
         head += ", %s %d job step(s)" % (args.jobs, len(steps))
     print(head)
     for line in describe(report):
